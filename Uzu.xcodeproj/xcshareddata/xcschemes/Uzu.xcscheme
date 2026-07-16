@@ -40,6 +40,17 @@
                ReferencedContainer = "container:Uzu.xcodeproj">
             </BuildableReference>
          </TestableReference>
+         <TestableReference
+            skipped = "NO"
+            parallelizable = "NO">
+            <BuildableReference
+               BuildableIdentifier = "primary"
+               BlueprintIdentifier = "1A000000000000000000001C"
+               BuildableName = "UzuUITests.xctest"
+               BlueprintName = "UzuUITests"
+               ReferencedContainer = "container:Uzu.xcodeproj">
+            </BuildableReference>
+         </TestableReference>
       </Testables>
    </TestAction>
    <LaunchAction
