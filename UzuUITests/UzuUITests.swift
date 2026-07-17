@@ -9,31 +9,54 @@ final class UzuUITests: XCTestCase {
     }
 
     @MainActor
-    func testRecordAPartCreatesTrackRow() throws {
+    func testAddAPartFullFlowCreatesTrackRow() throws {
         let app = XCUIApplication()
         app.launch()
 
-        let recordButton = app.buttons["Record a part"]
-        XCTAssertTrue(recordButton.waitForExistence(timeout: 10), "Record button should be on screen")
-        recordButton.tap()
+        let addPart = app.buttons["Add a part"]
+        XCTAssertTrue(addPart.waitForExistence(timeout: 10), "Add a part button should be on screen")
+        addPart.tap()
 
-        // First run triggers the mic permission alert; accept it.
+        // Part-name preset picker.
+        let guitar = app.buttons["Guitar"]
+        XCTAssertTrue(guitar.waitForExistence(timeout: 5), "Name picker should appear")
+        guitar.tap()
+
+        // Mic permission alert (first run on a fresh device/clone).
         let springboard = XCUIApplication(bundleIdentifier: "com.apple.springboard")
         let allowButton = springboard.buttons["Allow"]
-        if allowButton.waitForExistence(timeout: 5) {
+        if allowButton.waitForExistence(timeout: 3) {
             allowButton.tap()
         }
 
-        // If the app survived engine start, the button flips to "Stop".
+        // Speaker notice (only appears when existing tracks would be muted —
+        // not on the first part, but kept for robustness on re-runs).
+        let recordOnSpeaker = app.alerts.buttons["Record"]
+        if recordOnSpeaker.waitForExistence(timeout: 3) {
+            recordOnSpeaker.tap()
+        }
+        // Permission alert may come after the warning depending on timing.
+        if allowButton.waitForExistence(timeout: 3) {
+            allowButton.tap()
+        }
+
+        // Count-in (~2.4 s) runs, then the Stop button appears.
         let stopButton = app.buttons["Stop"]
-        XCTAssertTrue(stopButton.waitForExistence(timeout: 10), "App should be recording (and not have crashed)")
+        XCTAssertTrue(
+            stopButton.waitForExistence(timeout: 15),
+            "App should reach the recording stage (and not have crashed)")
 
         // Record ~3 seconds of (simulator host mic) audio.
         Thread.sleep(forTimeInterval: 3)
         stopButton.tap()
 
-        let trackRow = app.staticTexts["Part 1"]
-        XCTAssertTrue(trackRow.waitForExistence(timeout: 10), "A track row should appear after stopping")
+        // Review stage: Keep the take.
+        let keepButton = app.buttons["Keep"]
+        XCTAssertTrue(keepButton.waitForExistence(timeout: 10), "Review (Keep/Redo) should appear")
+        keepButton.tap()
+
+        let trackRow = app.staticTexts["Guitar"]
+        XCTAssertTrue(trackRow.waitForExistence(timeout: 10), "A track row should appear after keeping")
 
         XCTAssertTrue(app.state == .runningForeground, "App should still be running")
     }

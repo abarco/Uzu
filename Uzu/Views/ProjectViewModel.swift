@@ -10,10 +10,33 @@ final class ProjectViewModel {
         case unknown, granted, denied
     }
 
+    /// The overdub flow: idle → countIn → recording → review (Keep/Redo).
+    enum OverdubStage: Equatable {
+        case idle, countIn, recording, review
+    }
+
+    /// A finished take awaiting Keep/Redo.
+    struct PendingTake: Equatable {
+        var name: String
+        var fileName: String
+        var duration: TimeInterval
+        var startOffset: TimeInterval
+    }
+
+    static let partPresets = ["Guitar", "Vocals", "Backup vocals", "Percussion"]
+    static let countInBeats = 4
+    static let beatInterval: TimeInterval = 0.6
+
     private(set) var project: SongProject?
     private(set) var micPermission: MicPermission = .unknown
-    private(set) var isRecording = false
+    private(set) var overdubStage: OverdubStage = .idle
+    private(set) var countInRemaining = 0
     private(set) var recordingElapsed: TimeInterval = 0
+    private(set) var pendingTake: PendingTake?
+    private(set) var isPreviewingTake = false
+    /// True while a take is recording on the speaker with backing tracks
+    /// muted to prevent bleed (no headphones connected).
+    private(set) var backingMutedForSpeaker = false
     private(set) var playingTrackID: UUID?
     private(set) var isPlayingMix = false
     private(set) var playbackElapsed: TimeInterval = 0
@@ -25,9 +48,11 @@ final class ProjectViewModel {
 
     private let store: ProjectStore
     private let audio = AudioEngineService()
-    private var pendingRecordingFileName: String?
+    private var takeName: String?
+    private var takeFileName: String?
     private var recordingTimerTask: Task<Void, Never>?
     private var playbackTimerTask: Task<Void, Never>?
+    private var countInTask: Task<Void, Never>?
 
     init(store: ProjectStore = .standard()) {
         self.store = store
@@ -74,18 +99,20 @@ final class ProjectViewModel {
         UIApplication.shared.open(url)
     }
 
-    // MARK: - Recording
+    // MARK: - Overdub flow
 
-    func toggleRecording() async {
-        if isRecording {
-            await stopRecording()
-        } else {
-            await startRecording()
-        }
+    /// Whether the pre-record "no headphones" notice applies: on the speaker
+    /// AND there are tracks that would be muted during the take.
+    func shouldExplainSpeakerMuting() async -> Bool {
+        guard !(project?.tracks.isEmpty ?? true) else { return false }
+        // The session must be live for the route to be meaningful.
+        try? await audio.configureSessionIfNeeded()
+        return await audio.outputIsBuiltInSpeaker
     }
 
-    private func startRecording() async {
-        guard var project else { return }
+    /// Starts the take: count-in, then recording over all existing tracks.
+    func beginAddPart(named name: String) async {
+        guard overdubStage == .idle, var project else { return }
 
         if micPermission != .granted {
             let granted = await AVAudioApplication.requestRecordPermission()
@@ -96,6 +123,8 @@ final class ProjectViewModel {
             }
         }
 
+        await stopAllPlayback()
+
         do {
             try await audio.configureSessionIfNeeded()
             if project.sampleRate == 0 {
@@ -103,68 +132,189 @@ final class ProjectViewModel {
                 self.project = project
             }
             let fileName = "\(UUID().uuidString).caf"
-            let url = store.audioFileURL(fileName: fileName, projectID: project.id)
-            try await audio.startRecording(to: url)
-            pendingRecordingFileName = fileName
-            isRecording = true
-            startElapsedTimer()
+            // No headphones → the speaker would bleed straight into the mic,
+            // so the backing tracks are muted (still scheduled, volume 0, so
+            // the timing math is identical). The count-in click stays audible.
+            let onSpeaker = await audio.outputIsBuiltInSpeaker
+            backingMutedForSpeaker = onSpeaker && !project.tracks.isEmpty
+            var items = mixItems(for: project)
+            if onSpeaker {
+                for index in items.indices { items[index].isMuted = true }
+            }
+            let countInDuration = try await audio.startOverdub(
+                items: items,
+                recordTo: store.audioFileURL(fileName: fileName, projectID: project.id),
+                countInBeats: Self.countInBeats,
+                beatInterval: Self.beatInterval)
+            takeName = name
+            takeFileName = fileName
+            overdubStage = .countIn
+            runCountIn(duration: countInDuration)
         } catch let error as UzuError {
             errorMessage = error.userMessage
         } catch {
             errorMessage = "Couldn't start recording."
-            Log.record.error("Unexpected start failure: \(error)")
+            Log.record.error("Unexpected overdub start failure: \(error)")
         }
     }
 
-    private func stopRecording() async {
-        let duration = await audio.stopRecording()
-        finalizeRecording(duration: duration)
+    private func runCountIn(duration: TimeInterval) {
+        countInRemaining = Self.countInBeats
+        countInTask?.cancel()
+        countInTask = Task { [weak self] in
+            for beat in stride(from: Self.countInBeats - 1, through: 0, by: -1) {
+                try? await Task.sleep(for: .seconds(Self.beatInterval))
+                guard let self, !Task.isCancelled, self.overdubStage == .countIn else { return }
+                if beat > 0 {
+                    self.countInRemaining = beat
+                } else {
+                    self.overdubStage = .recording
+                    self.startElapsedTimer()
+                }
+            }
+        }
     }
 
-    /// Shared end-of-recording path for both user stops and external stops
-    /// (interruption, route change): keep the take as a track and persist.
-    private func finalizeRecording(duration: TimeInterval) {
-        stopElapsedTimer()
-        isRecording = false
-        guard var project, let fileName = pendingRecordingFileName else { return }
-        pendingRecordingFileName = nil
+    /// Stop button during count-in (cancels the take) or recording (ends it
+    /// and moves to review).
+    func stopTake() async {
+        switch overdubStage {
+        case .countIn:
+            countInTask?.cancel()
+            _ = await audio.stopOverdub()
+            removeTakeFile()
+            resetTakeState()
+        case .recording:
+            let result = await audio.stopOverdub()
+            moveToReview(result: result)
+        default:
+            break
+        }
+    }
 
-        guard duration > 0 else {
-            // Nothing usable was written; remove the empty file and say so
-            // instead of silently showing no new track.
-            try? FileManager.default.removeItem(
-                at: store.audioFileURL(fileName: fileName, projectID: project.id))
+    private func moveToReview(result: OverdubResult) {
+        stopElapsedTimer()
+        countInTask?.cancel()
+        // The file includes the count-in head (skipped on playback via the
+        // negative startOffset); what the user cares about — and what we store
+        // as Track.duration — is the audible part that lands in the mix.
+        let audibleDuration = result.duration + min(0, result.startOffset)
+        guard let takeName, let takeFileName, audibleDuration > 0 else {
+            removeTakeFile()
+            resetTakeState()
             errorMessage = "No audio was captured. Try recording again."
             return
         }
+        pendingTake = PendingTake(
+            name: takeName,
+            fileName: takeFileName,
+            duration: audibleDuration,
+            startOffset: result.startOffset)
+        overdubStage = .review
+    }
 
-        // Highest existing "Part n" + 1, so deletions never cause duplicates.
-        let nextNumber = 1 + (project.tracks
-            .compactMap { Int($0.name.dropFirst("Part ".count)) }
-            .max() ?? 0)
+    func keepTake() {
+        guard var project, let take = pendingTake else { return }
         let track = Track(
             id: UUID(),
-            name: "Part \(nextNumber)",
-            fileName: fileName,
+            name: uniqueName(for: take.name, in: project),
+            fileName: take.fileName,
             gain: 1.0,
             isMuted: false,
-            startOffset: 0,  // latency compensation lands in phase 3
-            duration: duration,
+            startOffset: take.startOffset,
+            duration: take.duration,
             createdAt: Date()
         )
         project.tracks.append(track)
         self.project = project
-        do {
-            try store.save(project)
-        } catch {
-            Log.store.error("Failed to save project after recording: \(error)")
-            errorMessage = "The recording finished but couldn't be saved to the project."
+        persist(project)
+        Task { await stopTakePreview() }
+        resetTakeState()
+    }
+
+    /// Throw the take away without recording a replacement.
+    func discardTake() async {
+        await stopTakePreview()
+        removeTakeFile()
+        resetTakeState()
+    }
+
+    func redoTake() async {
+        guard let name = takeName ?? pendingTake?.name else { return }
+        await stopTakePreview()
+        removeTakeFile()
+        resetTakeState()
+        await beginAddPart(named: name)
+    }
+
+    /// Preview the pending take (mixed with nothing — just the take itself,
+    /// with its count-in head skipped).
+    func toggleTakePreview() async {
+        guard let take = pendingTake, let project else { return }
+        if isPreviewingTake {
+            await stopTakePreview()
+            return
         }
+        let item = MixItem(
+            trackID: UUID(),
+            fileURL: store.audioFileURL(fileName: take.fileName, projectID: project.id),
+            gain: 1.0,
+            isMuted: false,
+            startOffset: min(0, take.startOffset)
+        )
+        if await startPlayback(items: [item]) {
+            isPreviewingTake = true
+        }
+    }
+
+    private func stopTakePreview() async {
+        if isPreviewingTake {
+            await audio.stopPlayback()
+            isPreviewingTake = false
+        }
+    }
+
+    private func resetTakeState() {
+        overdubStage = .idle
+        pendingTake = nil
+        takeName = nil
+        takeFileName = nil
+        countInRemaining = 0
+        backingMutedForSpeaker = false
+        stopElapsedTimer()
+    }
+
+    private func removeTakeFile() {
+        guard let project, let fileName = takeFileName ?? pendingTake?.fileName else { return }
+        try? FileManager.default.removeItem(
+            at: store.audioFileURL(fileName: fileName, projectID: project.id))
+    }
+
+    private func mixItems(for project: SongProject) -> [MixItem] {
+        project.tracks.map { track in
+            MixItem(
+                trackID: track.id,
+                fileURL: store.audioFileURL(fileName: track.fileName, projectID: project.id),
+                gain: track.gain,
+                isMuted: track.isMuted,
+                startOffset: track.startOffset
+            )
+        }
+    }
+
+    /// "Guitar", then "Guitar 2", "Guitar 3", … on repeats.
+    private func uniqueName(for base: String, in project: SongProject) -> String {
+        let existing = Set(project.tracks.map(\.name))
+        if !existing.contains(base) { return base }
+        var counter = 2
+        while existing.contains("\(base) \(counter)") { counter += 1 }
+        return "\(base) \(counter)"
     }
 
     // MARK: - Playback
 
-    /// Solo preview of one track, raw (ignores its mix gain/mute).
+    /// Solo preview of one track, raw gain but latency-aligned (count-in head
+    /// skipped via its negative startOffset).
     func togglePlayback(for track: Track) async {
         if playingTrackID == track.id {
             await stopAllPlayback()
@@ -176,7 +326,7 @@ final class ProjectViewModel {
             fileURL: store.audioFileURL(fileName: track.fileName, projectID: project.id),
             gain: 1.0,
             isMuted: false,
-            startOffset: 0
+            startOffset: min(0, track.startOffset)
         )
         if await startPlayback(items: [item]) {
             playingTrackID = track.id
@@ -190,16 +340,7 @@ final class ProjectViewModel {
             return
         }
         guard let project, !project.tracks.isEmpty else { return }
-        let items = project.tracks.map { track in
-            MixItem(
-                trackID: track.id,
-                fileURL: store.audioFileURL(fileName: track.fileName, projectID: project.id),
-                gain: track.gain,
-                isMuted: track.isMuted,
-                startOffset: track.startOffset
-            )
-        }
-        if await startPlayback(items: items) {
+        if await startPlayback(items: mixItems(for: project)) {
             isPlayingMix = true
             startPlaybackTimer()
         }
@@ -230,6 +371,7 @@ final class ProjectViewModel {
     private func clearPlaybackState() {
         playingTrackID = nil
         isPlayingMix = false
+        isPreviewingTake = false
         stopPlaybackTimer()
     }
 
@@ -261,6 +403,20 @@ final class ProjectViewModel {
         persist(project)
     }
 
+    // MARK: - Deleting tracks
+
+    func deleteTrack(_ track: Track) async {
+        guard var project else { return }
+        // Deleting from under an active mix/preview would leave dangling nodes.
+        await stopAllPlayback()
+        project.tracks.removeAll { $0.id == track.id }
+        self.project = project
+        try? FileManager.default.removeItem(
+            at: store.audioFileURL(fileName: track.fileName, projectID: project.id))
+        persist(project)
+        Log.ui.info("Deleted track \(track.id, privacy: .public)")
+    }
+
     private func persist(_ project: SongProject) {
         do {
             try store.save(project)
@@ -276,49 +432,31 @@ final class ProjectViewModel {
         switch event {
         case .playbackFinished:
             clearPlaybackState()
-        case .recordingStoppedExternally(let duration, let reason):
+        case .recordingStoppedExternally(let result, let reason):
             switch reason {
-            case .interrupted:
-                finalizeRecording(duration: duration)
-                errorMessage = UzuError.interruptedWhileRecording.userMessage
             case .routeChanged:
                 // One take = one microphone. A mid-take mic change is a user
                 // error: discard, and say so.
-                discardPendingRecording()
+                countInTask?.cancel()
+                stopElapsedTimer()
+                removeTakeFile()
+                resetTakeState()
                 errorMessage = "Recording discarded: the microphone changed during the take (headphones connected or disconnected). Pick one mic and record again."
+            case .interrupted:
+                moveToReview(result: result)
+                if pendingTake != nil {
+                    errorMessage = UzuError.interruptedWhileRecording.userMessage
+                }
             case .micMuted:
-                finalizeRecording(duration: duration)
-                errorMessage = "Recording stopped: the microphone was muted (Control Center or your headphones' mute). That's usually accidental — unmute and record again."
+                moveToReview(result: result)
+                if pendingTake != nil {
+                    errorMessage = "Recording stopped: the microphone was muted (Control Center or your headphones' mute). That's usually accidental — you can Keep or Redo the partial take."
+                }
             }
         }
     }
 
-    /// Ends the recording UI state and removes the take's file without
-    /// creating a track.
-    private func discardPendingRecording() {
-        stopElapsedTimer()
-        isRecording = false
-        guard let project, let fileName = pendingRecordingFileName else { return }
-        pendingRecordingFileName = nil
-        try? FileManager.default.removeItem(
-            at: store.audioFileURL(fileName: fileName, projectID: project.id))
-    }
-
-    // MARK: - Deleting tracks
-
-    func deleteTrack(_ track: Track) async {
-        guard var project else { return }
-        // Deleting from under an active mix/preview would leave dangling nodes.
-        await stopAllPlayback()
-        project.tracks.removeAll { $0.id == track.id }
-        self.project = project
-        try? FileManager.default.removeItem(
-            at: store.audioFileURL(fileName: track.fileName, projectID: project.id))
-        persist(project)
-        Log.ui.info("Deleted track \(track.id, privacy: .public)")
-    }
-
-    // MARK: - Elapsed timer
+    // MARK: - Timers
 
     private func startElapsedTimer() {
         recordingElapsed = 0
@@ -326,10 +464,10 @@ final class ProjectViewModel {
         recordingTimerTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(100))
-                guard let self, self.isRecording else { return }
-                self.recordingElapsed = Double(
-                    started.duration(to: .now).components.seconds
-                ) + Double(started.duration(to: .now).components.attoseconds) / 1e18
+                guard let self, self.overdubStage == .recording else { return }
+                let elapsed = started.duration(to: .now)
+                self.recordingElapsed = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) / 1e18
             }
         }
     }
@@ -337,6 +475,7 @@ final class ProjectViewModel {
     private func stopElapsedTimer() {
         recordingTimerTask?.cancel()
         recordingTimerTask = nil
+        recordingElapsed = 0
     }
 
     private func startPlaybackTimer() {

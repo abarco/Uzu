@@ -46,6 +46,34 @@ struct SyncMathTests {
         #expect(SyncMath.mixDuration(of: tracks) == 13)
     }
 
+    @Test func placementPositiveOffsetStartsLaterPlaysAll() {
+        let p = SyncMath.placement(
+            anchor: 1_000, outputSampleRate: 48_000, fileSampleRate: 48_000, startOffset: 0.5)
+        #expect(p == SyncMath.TrackPlacement(startSampleTime: 25_000, sourceSkipFrames: 0))
+    }
+
+    @Test func placementNegativeOffsetSkipsFileHead() {
+        // File recorded 2.4 s before mix zero (count-in): starts AT the anchor,
+        // skipping 2.4 s of the file, in the FILE's own sample rate.
+        let p = SyncMath.placement(
+            anchor: 1_000, outputSampleRate: 48_000, fileSampleRate: 24_000, startOffset: -2.4)
+        #expect(p == SyncMath.TrackPlacement(startSampleTime: 1_000, sourceSkipFrames: 57_600))
+    }
+
+    @Test func placementZeroOffsetIsIdentity() {
+        let p = SyncMath.placement(
+            anchor: 42, outputSampleRate: 44_100, fileSampleRate: 44_100, startOffset: 0)
+        #expect(p == SyncMath.TrackPlacement(startSampleTime: 42, sourceSkipFrames: 0))
+    }
+
+    @Test func negativeOffsetTrackEndsAtItsAudibleDuration() {
+        // Overdub: file head (count-in) skipped, audible 5 s from mix zero.
+        let overdub = Track(
+            id: UUID(), name: "Vocals", fileName: "v.caf", gain: 1, isMuted: false,
+            startOffset: -2.6, duration: 5, createdAt: Date())
+        #expect(SyncMath.mixDuration(of: [overdub]) == 5)
+    }
+
     @Test func mutedTracksStillCountTowardDuration() {
         var track = Track(
             id: UUID(), name: "t", fileName: "t.caf", gain: 1, isMuted: true,

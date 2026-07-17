@@ -4,6 +4,11 @@ struct ProjectView: View {
     @State private var model = ProjectViewModel()
     @State private var expandedTrackID: UUID?
     @State private var trackToDelete: Track?
+    @State private var showNamePicker = false
+    @State private var showCustomNameEntry = false
+    @State private var customName = ""
+    @State private var speakerWarningPartName: String?
+    @State private var showDiscardConfirmation = false
 
     var body: some View {
         NavigationStack {
@@ -38,6 +43,21 @@ struct ProjectView: View {
     }
 
     private var trackListScreen: some View {
+        VStack(spacing: 0) {
+            ZStack {
+                // The count-in overlay must NOT cover the bottom bar — the
+                // Cancel button lives there and has to stay visible.
+                listArea
+                if model.overdubStage == .countIn {
+                    CountInOverlay(remaining: model.countInRemaining)
+                }
+            }
+            recordBar
+        }
+    }
+
+    @ViewBuilder
+    private var listArea: some View {
         VStack(spacing: 0) {
             if let project = model.project, !project.tracks.isEmpty {
                 List(project.tracks) { track in
@@ -82,7 +102,6 @@ struct ProjectView: View {
             } else {
                 emptyState
             }
-            recordBar
         }
     }
 
@@ -114,7 +133,7 @@ struct ProjectView: View {
                     .frame(width: 44, height: 44)
             }
             .buttonStyle(.plain)
-            .disabled(model.isRecording)
+            .disabled(model.overdubStage != .idle)
             .accessibilityLabel(model.isPlayingMix ? "Stop mix" : "Play mix")
 
             Text("\(Self.timeString(model.isPlayingMix ? model.playbackElapsed : 0)) / \(Self.timeString(model.mixDuration))")
@@ -128,32 +147,167 @@ struct ProjectView: View {
         .background(.bar)
     }
 
+    @ViewBuilder
     private var recordBar: some View {
         VStack(spacing: 8) {
-            if model.isRecording {
+            switch model.overdubStage {
+            case .idle:
+                addPartButton
+            case .countIn:
+                stopButton(label: "Cancel", icon: "xmark.circle.fill")
+            case .recording:
                 Text(Self.timeString(model.recordingElapsed))
                     .font(.title2.monospacedDigit())
                     .foregroundStyle(.red)
                     .accessibilityLabel("Recording time")
+                if model.backingMutedForSpeaker {
+                    Label("Other parts muted — no headphones", systemImage: "speaker.slash")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                stopButton(label: "Stop", icon: "stop.circle.fill")
+            case .review:
+                reviewBar
             }
-            Button {
-                Task { await model.toggleRecording() }
-            } label: {
-                Label(
-                    model.isRecording ? "Stop" : "Record a part",
-                    systemImage: model.isRecording ? "stop.circle.fill" : "record.circle"
-                )
-                .font(.title2.bold())
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 14)
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(.red)
-            .symbolEffect(.pulse, isActive: model.isRecording)
-            .padding(.horizontal)
         }
         .padding(.vertical, 12)
         .background(.bar)
+        .confirmationDialog("Name this part", isPresented: $showNamePicker, titleVisibility: .visible) {
+            ForEach(ProjectViewModel.partPresets, id: \.self) { preset in
+                Button(preset) { startPart(named: preset) }
+            }
+            Button("Other…") {
+                customName = ""
+                showCustomNameEntry = true
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .alert("Name this part", isPresented: $showCustomNameEntry) {
+            TextField("Part name", text: $customName)
+            Button("Record") {
+                let name = customName.trimmingCharacters(in: .whitespaces)
+                startPart(named: name.isEmpty ? "Part" : name)
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .alert(
+            "No headphones connected",
+            isPresented: Binding(
+                get: { speakerWarningPartName != nil },
+                set: { if !$0 { speakerWarningPartName = nil } }
+            )
+        ) {
+            Button("Record") {
+                if let name = speakerWarningPartName {
+                    speakerWarningPartName = nil
+                    Task { await model.beginAddPart(named: name) }
+                }
+            }
+            Button("Cancel", role: .cancel) { speakerWarningPartName = nil }
+        } message: {
+            Text("Your other parts will be muted while you record so the speaker doesn't bleed into the mic. You'll still hear the count-in. Put on headphones to hear your parts while recording.")
+        }
+        .alert("Discard this take?", isPresented: $showDiscardConfirmation) {
+            Button("Discard", role: .destructive) {
+                Task { await model.discardTake() }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The recording will be deleted and nothing will be added to your song.")
+        }
+    }
+
+    private var addPartButton: some View {
+        Button {
+            showNamePicker = true
+        } label: {
+            Label("Add a part", systemImage: "record.circle")
+                .font(.title2.bold())
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.red)
+        .padding(.horizontal)
+    }
+
+    private func stopButton(label: String, icon: String) -> some View {
+        Button {
+            Task { await model.stopTake() }
+        } label: {
+            Label(label, systemImage: icon)
+                .font(.title2.bold())
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+        }
+        .buttonStyle(.borderedProminent)
+        .tint(.red)
+        .symbolEffect(.pulse, isActive: model.overdubStage == .recording)
+        .padding(.horizontal)
+    }
+
+    private var reviewBar: some View {
+        VStack(spacing: 10) {
+            HStack {
+                Text("\"\(model.pendingTake?.name ?? "")\" — \(Self.timeString(model.pendingTake?.duration ?? 0))")
+                    .font(.subheadline.weight(.medium))
+                Spacer()
+                Button {
+                    Task { await model.toggleTakePreview() }
+                } label: {
+                    Image(systemName: model.isPreviewingTake ? "stop.circle.fill" : "play.circle")
+                        .font(.title2)
+                }
+                .buttonStyle(.plain)
+                .accessibilityLabel(model.isPreviewingTake ? "Stop preview" : "Preview take")
+
+                Button {
+                    showDiscardConfirmation = true
+                } label: {
+                    Image(systemName: "trash")
+                        .font(.title3)
+                        .foregroundStyle(.red)
+                }
+                .buttonStyle(.plain)
+                .padding(.leading, 8)
+                .accessibilityLabel("Discard take")
+            }
+            .padding(.horizontal)
+
+            HStack(spacing: 12) {
+                Button {
+                    Task { await model.redoTake() }
+                } label: {
+                    Label("Redo", systemImage: "arrow.counterclockwise")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    model.keepTake()
+                } label: {
+                    Label("Keep", systemImage: "checkmark.circle.fill")
+                        .font(.headline)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 12)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.green)
+            }
+            .padding(.horizontal)
+        }
+    }
+
+    private func startPart(named name: String) {
+        Task {
+            if await model.shouldExplainSpeakerMuting() {
+                speakerWarningPartName = name
+            } else {
+                await model.beginAddPart(named: name)
+            }
+        }
     }
 
     static func timeString(_ seconds: TimeInterval) -> String {
@@ -224,6 +378,27 @@ private struct TrackRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+}
+
+private struct CountInOverlay: View {
+    let remaining: Int
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Text("\(remaining)")
+                .font(.system(size: 140, weight: .bold, design: .rounded))
+                .monospacedDigit()
+                .contentTransition(.numericText(countsDown: true))
+                .animation(.snappy, value: remaining)
+            Text("Get ready…")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(.ultraThinMaterial)
+        .allowsHitTesting(false)
+        .accessibilityLabel("Count-in: \(remaining)")
     }
 }
 

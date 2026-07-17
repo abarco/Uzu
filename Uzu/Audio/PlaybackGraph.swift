@@ -18,6 +18,7 @@ final class PlaybackGraph {
         let trackID: UUID
         let node: AVAudioPlayerNode
         let startOffset: TimeInterval
+        let fileSampleRate: Double
     }
 
     private var players: [ActivePlayer] = []
@@ -43,38 +44,54 @@ final class PlaybackGraph {
         let finishCounter = FinishCounter(target: items.count) { onAllFinished() }
         for item in items {
             let file = try AVAudioFile(forReading: item.fileURL)
+            let fileRate = file.processingFormat.sampleRate
             let node = AVAudioPlayerNode()
             engine.attach(node)
             engine.connect(node, to: engine.mainMixerNode, format: file.processingFormat)
             node.volume = item.isMuted ? 0 : item.gain
-            node.scheduleFile(file, at: nil, completionCallbackType: .dataPlayedBack) { [weak self] _ in
+
+            // Negative offsets (overdubs: count-in + latency shift) skip the
+            // file's head instead of starting before the anchor.
+            let skip = SyncMath.placement(
+                anchor: 0, outputSampleRate: fileRate, fileSampleRate: fileRate,
+                startOffset: item.startOffset
+            ).sourceSkipFrames
+            let remaining = AVAudioFrameCount(max(0, file.length - skip))
+            let completion: (AVAudioPlayerNodeCompletionCallbackType) -> Void = { [weak self] _ in
                 finishCounter.increment(ifCurrent: thisGeneration) { [weak self] in
                     self?.generation ?? -1
                 }
             }
-            players.append(ActivePlayer(trackID: item.trackID, node: node, startOffset: item.startOffset))
+            if remaining == 0 {
+                // Nothing of this file lands after the anchor; count it done.
+                finishCounter.increment(ifCurrent: thisGeneration) { [weak self] in
+                    self?.generation ?? -1
+                }
+            } else if skip > 0 {
+                node.scheduleSegment(
+                    file, startingFrame: skip, frameCount: remaining, at: nil,
+                    completionCallbackType: .dataPlayedBack, completionHandler: completion)
+            } else {
+                node.scheduleFile(
+                    file, at: nil, completionCallbackType: .dataPlayedBack,
+                    completionHandler: completion)
+            }
+            players.append(
+                ActivePlayer(
+                    trackID: item.trackID, node: node, startOffset: item.startOffset,
+                    fileSampleRate: fileRate))
         }
         Log.playback.info("Prepared mix of \(items.count) track(s)")
     }
 
-    /// Starts every prepared player against one shared anchor. The engine must
-    /// be running (the output node needs a valid render time).
-    func begin(engine: AVAudioEngine) {
-        guard let renderTime = engine.outputNode.lastRenderTime,
-            renderTime.isSampleTimeValid
-        else {
-            // No valid render clock (should not happen with a running engine);
-            // degrade to unanchored starts rather than not playing at all.
-            Log.playback.error("No valid render time; starting unanchored")
-            for player in players { player.node.play() }
-            return
-        }
-        let sampleRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
-        // Anchor slightly in the future so every node has time to arm.
-        let anchor = renderTime.sampleTime + AVAudioFramePosition((0.15 * sampleRate).rounded())
+    /// Starts every prepared player against the given shared anchor
+    /// (output-clock sample time). The engine must be running.
+    func begin(engine: AVAudioEngine, anchor: AVAudioFramePosition, sampleRate: Double) {
         for player in players {
-            let startSample = SyncMath.startSampleTime(
-                anchor: anchor, sampleRate: sampleRate, startOffset: player.startOffset)
+            let startSample = SyncMath.placement(
+                anchor: anchor, outputSampleRate: sampleRate,
+                fileSampleRate: player.fileSampleRate, startOffset: player.startOffset
+            ).startSampleTime
             player.node.play(at: AVAudioTime(sampleTime: startSample, atRate: sampleRate))
         }
         Log.playback.info("Mix started: anchor=\(anchor) rate=\(sampleRate)")

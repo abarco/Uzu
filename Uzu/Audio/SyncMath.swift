@@ -18,7 +18,39 @@ enum SyncMath {
     }
 
     /// Total mix length: the furthest point any track reaches.
+    /// `duration` is the AUDIBLE length. A negative offset means the file's
+    /// head is skipped and the audible part starts at mix zero, so only
+    /// positive offsets push a track's end later.
     static func mixDuration(of tracks: [Track]) -> TimeInterval {
-        tracks.map { $0.startOffset + $0.duration }.max() ?? 0
+        tracks.map { max(0, $0.startOffset) + $0.duration }.max() ?? 0
+    }
+
+    /// How to schedule one track against the shared anchor, supporting
+    /// negative offsets (overdubs whose file begins before mix zero: count-in
+    /// plus latency compensation).
+    struct TrackPlacement: Equatable {
+        /// Output-clock sample time at which the node starts playing.
+        var startSampleTime: AVAudioFramePosition
+        /// Frames of the source file to skip (in the FILE's sample rate).
+        var sourceSkipFrames: AVAudioFramePosition
+    }
+
+    /// Positive offset → start later, play the whole file.
+    /// Negative offset → start at the anchor, skip the file's head.
+    static func placement(
+        anchor: AVAudioFramePosition,
+        outputSampleRate: Double,
+        fileSampleRate: Double,
+        startOffset: TimeInterval
+    ) -> TrackPlacement {
+        if startOffset >= 0 {
+            return TrackPlacement(
+                startSampleTime: anchor
+                    + AVAudioFramePosition((startOffset * outputSampleRate).rounded()),
+                sourceSkipFrames: 0)
+        }
+        return TrackPlacement(
+            startSampleTime: anchor,
+            sourceSkipFrames: AVAudioFramePosition((-startOffset * fileSampleRate).rounded()))
     }
 }

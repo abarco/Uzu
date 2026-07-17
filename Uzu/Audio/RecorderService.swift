@@ -6,8 +6,17 @@ final class RecorderService {
     private let lock = NSLock()
     private var file: AVAudioFile?
     private var writeError: Error?
+    private var firstBufferHostTime: UInt64?
 
     private(set) var isRecording = false
+
+    /// Host-clock seconds of the first recorded sample, for latency-compensated
+    /// placement. Nil until the first buffer arrives.
+    var recordedStartHostSeconds: TimeInterval? {
+        lock.lock()
+        defer { lock.unlock() }
+        return firstBufferHostTime.map { AVAudioTime.seconds(forHostTime: $0) }
+    }
 
     /// Touches the input node so the engine graph is non-empty. Must be called
     /// BEFORE `engine.start()` — starting with an empty graph raises an
@@ -38,16 +47,20 @@ final class RecorderService {
         lock.lock()
         self.file = file
         self.writeError = nil
+        self.firstBufferHostTime = nil
         lock.unlock()
 
         // format: nil → the tap always uses the node's current output format.
         // A mismatch can then only surface as a catchable file-write error,
         // never as an NSException at engine start.
-        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, _ in
+        input.installTap(onBus: 0, bufferSize: 4096, format: nil) { [weak self] buffer, when in
             guard let self else { return }
             self.lock.lock()
             defer { self.lock.unlock() }
             guard let file = self.file else { return }
+            if self.firstBufferHostTime == nil, when.isHostTimeValid {
+                self.firstBufferHostTime = when.hostTime
+            }
             do {
                 try file.write(from: buffer)
             } catch {

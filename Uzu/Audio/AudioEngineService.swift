@@ -4,18 +4,27 @@ import AVFoundation
 /// interruptions, route changes, playback finishing on its own.
 enum AudioEngineEvent: Sendable {
     case playbackFinished
-    case recordingStoppedExternally(duration: TimeInterval, reason: RecordingStopReason)
+    case recordingStoppedExternally(result: OverdubResult, reason: RecordingStopReason)
 }
 
 enum RecordingStopReason: Sendable {
-    case interrupted     // phone call, Siri, alarm — partial take is kept
+    case interrupted     // phone call, Siri, alarm — partial take goes to review
     case routeChanged    // mic/route changed mid-take — take is discarded (user error)
-    case micMuted        // system mic-mute (Control Center / AirPods stem) — partial kept
+    case micMuted        // system mic-mute (Control Center / AirPods stem) — partial to review
 }
 
-/// The single owner of AVAudioEngine and AVAudioSession (see CLAUDE.md § Architecture).
-/// Recorder, playback, and (later) export all go through this actor, which keeps
-/// every engine mutation off the main thread.
+/// What a finished take measured: file duration and its latency-compensated
+/// placement on the mix timeline (negative = file head precedes mix zero,
+/// which is normal: it contains the count-in).
+struct OverdubResult: Sendable {
+    var duration: TimeInterval
+    var startOffset: TimeInterval
+}
+
+/// The single owner of AVAudioEngine and AVAudioSession (see CLAUDE.md
+/// § Architecture). Recording is always an "overdub": count-in clicks, then
+/// all existing tracks play sample-synchronized while the mic records. The
+/// first part is simply an overdub over an empty mix.
 actor AudioEngineService {
     // Recreated (not reused) for every session start and after route/config
     // changes: a fresh engine derives all IO formats from the current route,
@@ -24,14 +33,24 @@ actor AudioEngineService {
     private var engine = AVAudioEngine()
     private let recorder = RecorderService()
     private let playback = PlaybackGraph()
+    private let click = ClickTrack()
 
     private var sessionConfigured = false
     private var notificationObservers: [NSObjectProtocol] = []
     private var eventHandler: (@Sendable (AudioEngineEvent) -> Void)?
 
-    // Auto-restart bookkeeping: a route flip right after record-start (BT
-    // grabbing the session) restarts the take instead of killing it.
-    private var currentRecordingURL: URL?
+    /// Everything needed to (re)start the current take — kept so a route flip
+    /// at record-start can restart the whole overdub transparently.
+    private struct OverdubContext {
+        let url: URL
+        let items: [MixItem]
+        let countInBeats: Int
+        let beatInterval: TimeInterval
+        var countInDuration: TimeInterval { Double(countInBeats) * beatInterval }
+    }
+    private var overdubContext: OverdubContext?
+    private var mixZeroHostSeconds: TimeInterval?
+    private var latenciesAtStart: (input: TimeInterval, output: TimeInterval) = (0, 0)
     private var autoRestartCount = 0
 
     var isRecording: Bool { recorder.isRecording }
@@ -45,15 +64,13 @@ actor AudioEngineService {
         observeSessionNotifications()
     }
 
-    /// `.playAndRecord` without `.defaultToSpeaker`: review through the receiver /
-    /// headphones, not the loudspeaker, while recording flows are active.
     func configureSessionIfNeeded() throws {
         guard !sessionConfigured else { return }
         let session = AVAudioSession.sharedInstance()
         do {
             // .defaultToSpeaker: review through the loudspeaker instead of the
             // barely-audible earpiece. Headphones/BT still take priority when
-            // connected; phase 3's headphone warning covers speaker-bleed.
+            // connected; the headphone warning covers speaker-bleed.
             try session.setCategory(
                 .playAndRecord, mode: .default,
                 options: [.allowBluetoothHFP, .defaultToSpeaker])
@@ -73,73 +90,145 @@ actor AudioEngineService {
         AVAudioSession.sharedInstance().sampleRate
     }
 
-    // MARK: - Recording
+    /// True when playback would come out of the built-in speaker (the
+    /// "use headphones" warning case for overdubs).
+    var outputIsBuiltInSpeaker: Bool {
+        AVAudioSession.sharedInstance().currentRoute.outputs
+            .contains { $0.portType == .builtInSpeaker }
+    }
 
-    func startRecording(to url: URL) throws {
+    // MARK: - Overdub (the only way to record)
+
+    /// Starts the full overdub sequence: count-in clicks at the anchor, all
+    /// `items` starting together at mix zero (anchor + count-in), and the mic
+    /// recording throughout. Returns the count-in duration for the UI
+    /// countdown.
+    func startOverdub(
+        items: [MixItem], recordTo url: URL, countInBeats: Int = 4,
+        beatInterval: TimeInterval = 0.6
+    ) throws -> TimeInterval {
         try configureSessionIfNeeded()
-        playback.stop(engine: engine)
         autoRestartCount = 0
-        currentRecordingURL = url
-        try startEngineAndTap(to: url)
-        Log.record.info("Recording started → \(url.lastPathComponent, privacy: .public)")
+        let context = OverdubContext(
+            url: url, items: items, countInBeats: countInBeats, beatInterval: beatInterval)
+        overdubContext = context
+        try startOverdubCore()
+        return context.countInDuration
     }
 
     /// Ordering matters (each step guards against a distinct crash):
-    /// 1. fresh engine — nothing from a previous route can leak in;
-    /// 2. touch the input node — the engine must not start on an empty graph;
-    /// 3. start the engine — only a running IO unit reports the true input format;
-    /// 4. create the file + tap from that live format.
-    private func startEngineAndTap(to url: URL) throws {
+    /// fresh engine → touch input node (graph must not start empty) → attach
+    /// players/click → start engine → schedule everything against one anchor →
+    /// install the tap using the now-live input format.
+    private func startOverdubCore() throws {
+        guard let context = overdubContext else { return }
         rebuildEngine()
         recorder.attachInput(engine: engine)
+        click.prepare(engine: engine)
+        try playback.prepare(items: context.items, engine: engine, onAllFinished: {
+            // Backing tracks ending while recording continues is normal; the
+            // take keeps going until the user stops it.
+        })
         engine.prepare()
         do {
             try engine.start()
         } catch {
             throw UzuError.engineStartFailed(underlying: error)
         }
+
+        guard let renderTime = engine.outputNode.lastRenderTime,
+            renderTime.isSampleTimeValid, renderTime.isHostTimeValid
+        else {
+            engine.stop()
+            throw UzuError.engineStartFailed(
+                underlying: NSError(
+                    domain: "com.uzu.app", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "No render clock after engine start"]))
+        }
+        let sampleRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        let anchor = renderTime.sampleTime + AVAudioFramePosition((0.2 * sampleRate).rounded())
+        let mixZeroSample =
+            anchor
+            + AVAudioFramePosition((context.countInDuration * sampleRate).rounded())
+        mixZeroHostSeconds = LatencyMath.hostSeconds(
+            ofSample: mixZeroSample,
+            referenceSample: renderTime.sampleTime,
+            referenceHostSeconds: AVAudioTime.seconds(forHostTime: renderTime.hostTime),
+            sampleRate: sampleRate)
+
+        let session = AVAudioSession.sharedInstance()
+        latenciesAtStart = (session.inputLatency, session.outputLatency)
+
+        click.scheduleAndPlay(
+            beats: context.countInBeats, anchor: anchor,
+            interval: context.beatInterval, sampleRate: sampleRate)
+        playback.begin(engine: engine, anchor: mixZeroSample, sampleRate: sampleRate)
+
         do {
-            try recorder.beginWriting(engine: engine, url: url)
+            try recorder.beginWriting(engine: engine, url: context.url)
         } catch let error as UzuError {
-            stopEngineIfIdle()
+            rebuildEngine()
             throw error
         } catch {
-            stopEngineIfIdle()
-            try? FileManager.default.removeItem(at: url)
+            rebuildEngine()
+            try? FileManager.default.removeItem(at: context.url)
             throw UzuError.recordingWriteFailed(underlying: error)
         }
+        Log.record.info(
+            "Overdub started → \(context.url.lastPathComponent, privacy: .public), \(context.items.count) backing track(s), inLat=\(self.latenciesAtStart.input) outLat=\(self.latenciesAtStart.output)"
+        )
     }
 
-    /// Stops a user-requested recording and returns the recorded duration.
-    func stopRecording() -> TimeInterval {
-        currentRecordingURL = nil
-        let duration = recorder.stop(engine: engine)
-        stopEngineIfIdle()
-        Log.record.info("Recording stopped: \(duration, format: .fixed(precision: 2))s, latency offset applied: 0 (phase 1)")
-        return duration
-    }
-
-    /// Shared path for recordings cut short from outside (route change,
-    /// interruption). A route flip with (almost) nothing captured yet is the
-    /// normal Bluetooth record-start dance — restart transparently on the new
-    /// route instead of killing the take. Anything else finalizes the partial
-    /// take and informs the UI (always, even for empty takes).
-    private func handleRecordingDisrupted(reason: RecordingStopReason) {
-        let duration = recorder.stop(engine: engine)
+    /// Stops a user-requested take and returns its duration + placement.
+    func stopOverdub() -> OverdubResult {
+        let result = finalizeTakeMeasurements()
+        overdubContext = nil
         rebuildEngine()
-        if reason == .routeChanged, duration < 0.5, autoRestartCount < 2,
-            let url = currentRecordingURL {
+        Log.record.info(
+            "Overdub stopped: \(result.duration, format: .fixed(precision: 2))s, applied latency offset \(result.startOffset, format: .fixed(precision: 4))s"
+        )
+        return result
+    }
+
+    /// Reads duration and computes the latency-compensated start offset for
+    /// the take that is currently (or was just) recording.
+    private func finalizeTakeMeasurements() -> OverdubResult {
+        let duration = recorder.stop(engine: engine)
+        let startOffset: TimeInterval
+        if let recordedStart = recorder.recordedStartHostSeconds,
+            let mixZero = mixZeroHostSeconds {
+            startOffset = LatencyMath.overdubStartOffset(
+                recordedStartTime: recordedStart,
+                mixZeroTime: mixZero,
+                inputLatency: latenciesAtStart.input,
+                outputLatency: latenciesAtStart.output)
+        } else {
+            startOffset = 0
+        }
+        return OverdubResult(duration: duration, startOffset: startOffset)
+    }
+
+    /// Shared path for takes cut short from outside. A route flip while the
+    /// take has barely begun (count-in + a beat — the normal Bluetooth
+    /// record-start dance) restarts the whole overdub transparently on the new
+    /// route. Everything else ends the take and informs the UI.
+    private func handleRecordingDisrupted(reason: RecordingStopReason) {
+        guard let context = overdubContext else { return }
+        let result = finalizeTakeMeasurements()
+        rebuildEngine()
+        let graceWindow = context.countInDuration + 0.5
+        if reason == .routeChanged, result.duration < graceWindow, autoRestartCount < 2 {
             autoRestartCount += 1
             do {
-                try startEngineAndTap(to: url)
-                Log.record.info("Recording auto-restarted on new route (attempt \(self.autoRestartCount))")
+                try startOverdubCore()
+                Log.record.info("Overdub auto-restarted on new route (attempt \(self.autoRestartCount))")
                 return
             } catch {
                 Log.record.error("Auto-restart after route change failed: \(error)")
             }
         }
-        currentRecordingURL = nil
-        eventHandler?(.recordingStoppedExternally(duration: duration, reason: reason))
+        overdubContext = nil
+        eventHandler?(.recordingStoppedExternally(result: result, reason: reason))
     }
 
     // MARK: - Playback
@@ -148,11 +237,9 @@ actor AudioEngineService {
     /// A single item is just a mix of one (used for per-track preview).
     func playMix(_ items: [MixItem]) throws {
         try configureSessionIfNeeded()
-        if recorder.isRecording { return }  // phase 2: no playback control while recording
+        if recorder.isRecording { return }
         guard !items.isEmpty else { return }
         let handler = eventHandler
-        // Same rules as recording: a fresh engine (a materialized input node
-        // keeps stale route formats too), and a non-empty graph before starting.
         rebuildEngine()
         try playback.prepare(items: items, engine: engine) {
             handler?(.playbackFinished)
@@ -164,7 +251,19 @@ actor AudioEngineService {
             playback.stop(engine: engine)
             throw UzuError.engineStartFailed(underlying: error)
         }
-        playback.begin(engine: engine)
+        guard let renderTime = engine.outputNode.lastRenderTime,
+            renderTime.isSampleTimeValid
+        else {
+            playback.stop(engine: engine)
+            engine.stop()
+            throw UzuError.engineStartFailed(
+                underlying: NSError(
+                    domain: "com.uzu.app", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "No render clock after engine start"]))
+        }
+        let sampleRate = engine.outputNode.outputFormat(forBus: 0).sampleRate
+        let anchor = renderTime.sampleTime + AVAudioFramePosition((0.15 * sampleRate).rounded())
+        playback.begin(engine: engine, anchor: anchor, sampleRate: sampleRate)
     }
 
     /// Live per-track volume while a mix is playing (mute = volume 0).
@@ -187,10 +286,11 @@ actor AudioEngineService {
             forName: AVAudioSession.interruptionNotification, object: nil, queue: nil
         ) { note in
             guard let raw = note.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
-                  let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
+                let type = AVAudioSession.InterruptionType(rawValue: raw) else { return }
             let shouldResume: Bool
             if let optRaw = note.userInfo?[AVAudioSessionInterruptionOptionKey] as? UInt {
-                shouldResume = AVAudioSession.InterruptionOptions(rawValue: optRaw).contains(.shouldResume)
+                shouldResume = AVAudioSession.InterruptionOptions(rawValue: optRaw).contains(
+                    .shouldResume)
             } else {
                 shouldResume = false
             }
@@ -239,48 +339,13 @@ actor AudioEngineService {
     private func handleInputMuteChange(muted: Bool) {
         Log.session.warning("Input mute state changed: muted=\(muted) (recording=\(self.recorder.isRecording))")
         guard muted, recorder.isRecording else { return }
-        let duration = recorder.stop(engine: engine)
-        rebuildEngine()
-        currentRecordingURL = nil
-        eventHandler?(.recordingStoppedExternally(duration: duration, reason: .micMuted))
-    }
-
-    /// The engine invalidated its graph (typically a route change: BT connect,
-    /// headphones unplugged). Finalize whatever was running and reset so the
-    /// next start re-derives formats from the current route (see error case #5).
-    private func handleEngineConfigurationChange(engineID: ObjectIdentifier?) {
-        guard engineID == ObjectIdentifier(engine) else {
-            Log.engine.info("Ignoring configuration change from a replaced engine")
-            return
-        }
-        Log.engine.warning("Engine configuration change (recording=\(self.recorder.isRecording), playing=\(self.playback.isPlaying))")
-        if recorder.isRecording {
-            handleRecordingDisrupted(reason: .routeChanged)
-        } else if playback.isPlaying {
-            rebuildEngine()
-            eventHandler?(.playbackFinished)
-        } else {
-            rebuildEngine()
-        }
-    }
-
-    /// Discards the current engine instance and creates a fresh one, finalizing
-    /// any recording/playback still attached to the old instance first.
-    private func rebuildEngine() {
-        if recorder.isRecording {
-            _ = recorder.stop(engine: engine)
-        }
-        playback.stop(engine: engine)
-        if engine.isRunning { engine.stop() }
-        engine = AVAudioEngine()
-        Log.engine.info("Engine rebuilt")
+        handleRecordingDisrupted(reason: .micMuted)
     }
 
     private func handleInterruption(began: Bool, shouldResume: Bool) {
         if began {
             Log.session.warning("Interruption began (recording=\(self.recorder.isRecording))")
             if recorder.isRecording {
-                // Finalize the partial take safely; the UI keeps it as a valid track.
                 handleRecordingDisrupted(reason: .interrupted)
             } else if playback.isPlaying {
                 rebuildEngine()
@@ -308,7 +373,36 @@ actor AudioEngineService {
         }
     }
 
+    private func handleEngineConfigurationChange(engineID: ObjectIdentifier?) {
+        guard engineID == ObjectIdentifier(engine) else {
+            Log.engine.info("Ignoring configuration change from a replaced engine")
+            return
+        }
+        Log.engine.warning("Engine configuration change (recording=\(self.recorder.isRecording), playing=\(self.playback.isPlaying))")
+        if recorder.isRecording {
+            handleRecordingDisrupted(reason: .routeChanged)
+        } else if playback.isPlaying {
+            rebuildEngine()
+            eventHandler?(.playbackFinished)
+        } else {
+            rebuildEngine()
+        }
+    }
+
     // MARK: - Helpers
+
+    /// Discards the current engine instance and creates a fresh one, finalizing
+    /// any recording/playback still attached to the old instance first.
+    private func rebuildEngine() {
+        if recorder.isRecording {
+            _ = recorder.stop(engine: engine)
+        }
+        playback.stop(engine: engine)
+        click.stop(engine: engine)
+        if engine.isRunning { engine.stop() }
+        engine = AVAudioEngine()
+        Log.engine.info("Engine rebuilt")
+    }
 
     private func stopEngineIfIdle() {
         // Stopping the engine when idle releases the mic (no lingering orange dot).
