@@ -15,12 +15,19 @@ final class ProjectViewModel {
     private(set) var isRecording = false
     private(set) var recordingElapsed: TimeInterval = 0
     private(set) var playingTrackID: UUID?
+    private(set) var isPlayingMix = false
+    private(set) var playbackElapsed: TimeInterval = 0
     var errorMessage: String?
+
+    var mixDuration: TimeInterval {
+        SyncMath.mixDuration(of: project?.tracks ?? [])
+    }
 
     private let store: ProjectStore
     private let audio = AudioEngineService()
     private var pendingRecordingFileName: String?
     private var recordingTimerTask: Task<Void, Never>?
+    private var playbackTimerTask: Task<Void, Never>?
 
     init(store: ProjectStore = .standard()) {
         self.store = store
@@ -131,9 +138,13 @@ final class ProjectViewModel {
             return
         }
 
+        // Highest existing "Part n" + 1, so deletions never cause duplicates.
+        let nextNumber = 1 + (project.tracks
+            .compactMap { Int($0.name.dropFirst("Part ".count)) }
+            .max() ?? 0)
         let track = Track(
             id: UUID(),
-            name: "Part \(project.tracks.count + 1)",
+            name: "Part \(nextNumber)",
             fileName: fileName,
             gain: 1.0,
             isMuted: false,
@@ -153,26 +164,109 @@ final class ProjectViewModel {
 
     // MARK: - Playback
 
+    /// Solo preview of one track, raw (ignores its mix gain/mute).
     func togglePlayback(for track: Track) async {
         if playingTrackID == track.id {
-            await audio.stopPlayback()
-            playingTrackID = nil
+            await stopAllPlayback()
             return
         }
         guard let project else { return }
-        let url = store.audioFileURL(fileName: track.fileName, projectID: project.id)
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            errorMessage = UzuError.trackFileMissing(trackID: track.id).userMessage
+        let item = MixItem(
+            trackID: track.id,
+            fileURL: store.audioFileURL(fileName: track.fileName, projectID: project.id),
+            gain: 1.0,
+            isMuted: false,
+            startOffset: 0
+        )
+        if await startPlayback(items: [item]) {
+            playingTrackID = track.id
+        }
+    }
+
+    /// Master play/stop of the whole mix, sample-synchronized.
+    func toggleMixPlayback() async {
+        if isPlayingMix {
+            await stopAllPlayback()
             return
         }
+        guard let project, !project.tracks.isEmpty else { return }
+        let items = project.tracks.map { track in
+            MixItem(
+                trackID: track.id,
+                fileURL: store.audioFileURL(fileName: track.fileName, projectID: project.id),
+                gain: track.gain,
+                isMuted: track.isMuted,
+                startOffset: track.startOffset
+            )
+        }
+        if await startPlayback(items: items) {
+            isPlayingMix = true
+            startPlaybackTimer()
+        }
+    }
+
+    private func startPlayback(items: [MixItem]) async -> Bool {
+        for item in items where !FileManager.default.fileExists(atPath: item.fileURL.path) {
+            errorMessage = UzuError.trackFileMissing(trackID: item.trackID).userMessage
+            return false
+        }
         do {
-            try await audio.play(fileURL: url)
-            playingTrackID = track.id
+            try await audio.playMix(items)
+            return true
         } catch let error as UzuError {
             errorMessage = error.userMessage
         } catch {
-            errorMessage = "Couldn't play that track."
+            errorMessage = "Couldn't play."
             Log.playback.error("Play failed: \(error)")
+        }
+        return false
+    }
+
+    private func stopAllPlayback() async {
+        await audio.stopPlayback()
+        clearPlaybackState()
+    }
+
+    private func clearPlaybackState() {
+        playingTrackID = nil
+        isPlayingMix = false
+        stopPlaybackTimer()
+    }
+
+    // MARK: - Track gain / mute
+
+    func setGain(_ gain: Float, for trackID: UUID) {
+        guard var project,
+            let index = project.tracks.firstIndex(where: { $0.id == trackID })
+        else { return }
+        project.tracks[index].gain = gain
+        self.project = project
+        let muted = project.tracks[index].isMuted
+        Task {
+            await audio.setTrackVolume(muted ? 0 : gain, trackID: trackID)
+        }
+        persist(project)
+    }
+
+    func toggleMute(for trackID: UUID) {
+        guard var project,
+            let index = project.tracks.firstIndex(where: { $0.id == trackID })
+        else { return }
+        project.tracks[index].isMuted.toggle()
+        self.project = project
+        let track = project.tracks[index]
+        Task {
+            await audio.setTrackVolume(track.isMuted ? 0 : track.gain, trackID: trackID)
+        }
+        persist(project)
+    }
+
+    private func persist(_ project: SongProject) {
+        do {
+            try store.save(project)
+        } catch {
+            Log.store.error("Failed to save project: \(error)")
+            errorMessage = "Couldn't save your changes."
         }
     }
 
@@ -181,16 +275,47 @@ final class ProjectViewModel {
     private func handle(_ event: AudioEngineEvent) {
         switch event {
         case .playbackFinished:
-            playingTrackID = nil
+            clearPlaybackState()
         case .recordingStoppedExternally(let duration, let reason):
-            finalizeRecording(duration: duration)
             switch reason {
             case .interrupted:
+                finalizeRecording(duration: duration)
                 errorMessage = UzuError.interruptedWhileRecording.userMessage
             case .routeChanged:
-                errorMessage = "Recording stopped because the audio route changed. Your partial take was kept."
+                // One take = one microphone. A mid-take mic change is a user
+                // error: discard, and say so.
+                discardPendingRecording()
+                errorMessage = "Recording discarded: the microphone changed during the take (headphones connected or disconnected). Pick one mic and record again."
+            case .micMuted:
+                finalizeRecording(duration: duration)
+                errorMessage = "Recording stopped: the microphone was muted (Control Center or your headphones' mute). That's usually accidental — unmute and record again."
             }
         }
+    }
+
+    /// Ends the recording UI state and removes the take's file without
+    /// creating a track.
+    private func discardPendingRecording() {
+        stopElapsedTimer()
+        isRecording = false
+        guard let project, let fileName = pendingRecordingFileName else { return }
+        pendingRecordingFileName = nil
+        try? FileManager.default.removeItem(
+            at: store.audioFileURL(fileName: fileName, projectID: project.id))
+    }
+
+    // MARK: - Deleting tracks
+
+    func deleteTrack(_ track: Track) async {
+        guard var project else { return }
+        // Deleting from under an active mix/preview would leave dangling nodes.
+        await stopAllPlayback()
+        project.tracks.removeAll { $0.id == track.id }
+        self.project = project
+        try? FileManager.default.removeItem(
+            at: store.audioFileURL(fileName: track.fileName, projectID: project.id))
+        persist(project)
+        Log.ui.info("Deleted track \(track.id, privacy: .public)")
     }
 
     // MARK: - Elapsed timer
@@ -212,5 +337,25 @@ final class ProjectViewModel {
     private func stopElapsedTimer() {
         recordingTimerTask?.cancel()
         recordingTimerTask = nil
+    }
+
+    private func startPlaybackTimer() {
+        playbackElapsed = 0
+        let started = ContinuousClock.now
+        playbackTimerTask = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(200))
+                guard let self, self.isPlayingMix else { return }
+                let elapsed = started.duration(to: .now)
+                self.playbackElapsed = Double(elapsed.components.seconds)
+                    + Double(elapsed.components.attoseconds) / 1e18
+            }
+        }
+    }
+
+    private func stopPlaybackTimer() {
+        playbackTimerTask?.cancel()
+        playbackTimerTask = nil
+        playbackElapsed = 0
     }
 }

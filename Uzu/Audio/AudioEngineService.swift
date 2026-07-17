@@ -8,8 +8,9 @@ enum AudioEngineEvent: Sendable {
 }
 
 enum RecordingStopReason: Sendable {
-    case interrupted     // phone call, Siri, alarm
-    case routeChanged    // headphones yanked, device changed
+    case interrupted     // phone call, Siri, alarm — partial take is kept
+    case routeChanged    // mic/route changed mid-take — take is discarded (user error)
+    case micMuted        // system mic-mute (Control Center / AirPods stem) — partial kept
 }
 
 /// The single owner of AVAudioEngine and AVAudioSession (see CLAUDE.md § Architecture).
@@ -50,7 +51,12 @@ actor AudioEngineService {
         guard !sessionConfigured else { return }
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetoothHFP])
+            // .defaultToSpeaker: review through the loudspeaker instead of the
+            // barely-audible earpiece. Headphones/BT still take priority when
+            // connected; phase 3's headphone warning covers speaker-bleed.
+            try session.setCategory(
+                .playAndRecord, mode: .default,
+                options: [.allowBluetoothHFP, .defaultToSpeaker])
             try session.setActive(true)
         } catch {
             throw UzuError.sessionConfigurationFailed(underlying: error)
@@ -138,14 +144,17 @@ actor AudioEngineService {
 
     // MARK: - Playback
 
-    func play(fileURL: URL) throws {
+    /// Plays any number of tracks sample-synchronized against a shared anchor.
+    /// A single item is just a mix of one (used for per-track preview).
+    func playMix(_ items: [MixItem]) throws {
         try configureSessionIfNeeded()
-        if recorder.isRecording { return }  // phase 1: no playback while recording
+        if recorder.isRecording { return }  // phase 2: no playback control while recording
+        guard !items.isEmpty else { return }
         let handler = eventHandler
         // Same rules as recording: a fresh engine (a materialized input node
         // keeps stale route formats too), and a non-empty graph before starting.
         rebuildEngine()
-        try playback.prepare(fileURL: fileURL, engine: engine) {
+        try playback.prepare(items: items, engine: engine) {
             handler?(.playbackFinished)
         }
         engine.prepare()
@@ -155,7 +164,12 @@ actor AudioEngineService {
             playback.stop(engine: engine)
             throw UzuError.engineStartFailed(underlying: error)
         }
-        playback.begin()
+        playback.begin(engine: engine)
+    }
+
+    /// Live per-track volume while a mix is playing (mute = volume 0).
+    func setTrackVolume(_ volume: Float, trackID: UUID) {
+        playback.setVolume(volume, trackID: trackID)
     }
 
     func stopPlayback() {
@@ -207,7 +221,28 @@ actor AudioEngineService {
             }
         }
 
-        notificationObservers = [interruption, routeChange, configChange]
+        // System mic-mute (Control Center, Action button, AirPods stem): iOS
+        // keeps delivering buffers of pure silence, so an unnoticed mute would
+        // quietly ruin the take.
+        let inputMute = center.addObserver(
+            forName: AVAudioApplication.inputMuteStateChangeNotification, object: nil, queue: nil
+        ) { note in
+            let muted = (note.userInfo?[AVAudioApplication.muteStateKey] as? Bool) ?? false
+            Task { [weak self] in
+                await self?.handleInputMuteChange(muted: muted)
+            }
+        }
+
+        notificationObservers = [interruption, routeChange, configChange, inputMute]
+    }
+
+    private func handleInputMuteChange(muted: Bool) {
+        Log.session.warning("Input mute state changed: muted=\(muted) (recording=\(self.recorder.isRecording))")
+        guard muted, recorder.isRecording else { return }
+        let duration = recorder.stop(engine: engine)
+        rebuildEngine()
+        currentRecordingURL = nil
+        eventHandler?(.recordingStoppedExternally(duration: duration, reason: .micMuted))
     }
 
     /// The engine invalidated its graph (typically a route change: BT connect,
