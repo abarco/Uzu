@@ -339,6 +339,7 @@ final class ProjectViewModel {
         )
         if await startPlayback(items: [item]) {
             playingTrackID = track.id
+            startPlaybackTimer()
         }
     }
 
@@ -444,6 +445,19 @@ final class ProjectViewModel {
         }
     }
 
+    // MARK: - Renaming tracks
+
+    func renameTrack(_ trackID: UUID, to newName: String) {
+        let name = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty,
+            var project,
+            let index = project.tracks.firstIndex(where: { $0.id == trackID })
+        else { return }
+        project.tracks[index].name = name
+        self.project = project
+        persist(project)
+    }
+
     // MARK: - Deleting tracks
 
     func deleteTrack(_ track: Track) async {
@@ -520,12 +534,13 @@ final class ProjectViewModel {
     }
 
     private func startPlaybackTimer() {
+        playbackTimerTask?.cancel()
         playbackElapsed = 0
         let started = ContinuousClock.now
         playbackTimerTask = Task { [weak self] in
             while !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(200))
-                guard let self, self.isPlayingMix else { return }
+                guard let self, self.isPlayingMix || self.playingTrackID != nil else { return }
                 let elapsed = started.duration(to: .now)
                 self.playbackElapsed = Double(elapsed.components.seconds)
                     + Double(elapsed.components.attoseconds) / 1e18

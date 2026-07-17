@@ -4,6 +4,8 @@ struct ProjectView: View {
     @State private var model = ProjectViewModel()
     @State private var expandedTrackID: UUID?
     @State private var trackToDelete: Track?
+    @State private var trackToRename: Track?
+    @State private var renameText = ""
     @State private var showNamePicker = false
     @State private var showCustomNameEntry = false
     @State private var customName = ""
@@ -88,6 +90,7 @@ struct ProjectView: View {
                     TrackRow(
                         track: track,
                         isPlaying: model.playingTrackID == track.id,
+                        playbackElapsed: model.playbackElapsed,
                         isExpanded: expandedTrackID == track.id,
                         togglePlay: { Task { await model.togglePlayback(for: track) } },
                         toggleMute: { model.toggleMute(for: track.id) },
@@ -105,6 +108,15 @@ struct ProjectView: View {
                             Label("Delete", systemImage: "trash")
                         }
                     }
+                    .swipeActions(edge: .leading) {
+                        Button {
+                            renameText = track.name
+                            trackToRename = track
+                        } label: {
+                            Label("Rename", systemImage: "pencil")
+                        }
+                        .tint(.blue)
+                    }
                 }
                 .listStyle(.plain)
                 .alert(
@@ -121,6 +133,20 @@ struct ProjectView: View {
                     Button("Cancel", role: .cancel) {}
                 } message: { _ in
                     Text("This part will be removed from the song. There's no undo.")
+                }
+                .alert(
+                    "Rename part",
+                    isPresented: Binding(
+                        get: { trackToRename != nil },
+                        set: { if !$0 { trackToRename = nil } }
+                    ),
+                    presenting: trackToRename
+                ) { track in
+                    TextField("Part name", text: $renameText)
+                    Button("Save") {
+                        model.renameTrack(track.id, to: renameText)
+                    }
+                    Button("Cancel", role: .cancel) {}
                 }
                 transportBar
             } else {
@@ -152,22 +178,26 @@ struct ProjectView: View {
             Button {
                 Task { await model.toggleMixPlayback() }
             } label: {
-                Image(systemName: model.isPlayingMix ? "stop.fill" : "play.fill")
-                    .font(.title2)
-                    .frame(width: 44, height: 44)
+                Label(
+                    model.isPlayingMix ? "Stop" : "Play all",
+                    systemImage: model.isPlayingMix ? "stop.fill" : "play.fill"
+                )
+                .font(.headline)
+                .padding(.vertical, 6)
+                .padding(.horizontal, 4)
             }
-            .buttonStyle(.plain)
+            .buttonStyle(.borderedProminent)
             .disabled(model.overdubStage != .idle)
-            .accessibilityLabel(model.isPlayingMix ? "Stop mix" : "Play mix")
+            .accessibilityLabel(model.isPlayingMix ? "Stop mix" : "Play all tracks together")
+
+            Spacer()
 
             Text("\(Self.timeString(model.isPlayingMix ? model.playbackElapsed : 0)) / \(Self.timeString(model.mixDuration))")
                 .font(.subheadline.monospacedDigit())
                 .foregroundStyle(.secondary)
-
-            Spacer()
         }
         .padding(.horizontal)
-        .padding(.vertical, 4)
+        .padding(.vertical, 8)
         .background(.bar)
     }
 
@@ -343,6 +373,7 @@ struct ProjectView: View {
 private struct TrackRow: View {
     let track: Track
     let isPlaying: Bool
+    let playbackElapsed: TimeInterval
     let isExpanded: Bool
     let togglePlay: () -> Void
     let toggleMute: () -> Void
@@ -363,9 +394,9 @@ private struct TrackRow: View {
                     Text(track.name)
                         .font(.body.weight(.medium))
                         .foregroundStyle(track.isMuted ? .secondary : .primary)
-                    Text(ProjectView.timeString(track.duration))
+                    Text(durationText)
                         .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(isPlaying ? .red : .secondary)
                 }
 
                 Spacer()
@@ -378,6 +409,12 @@ private struct TrackRow: View {
                 }
                 .buttonStyle(.plain)
                 .accessibilityLabel(track.isMuted ? "Unmute \(track.name)" : "Mute \(track.name)")
+
+                // Affordance: this row expands to reveal the volume slider.
+                Image(systemName: "chevron.down")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .rotationEffect(.degrees(isExpanded ? 180 : 0))
             }
             .contentShape(Rectangle())
             .onTapGesture(perform: toggleExpanded)
@@ -402,6 +439,13 @@ private struct TrackRow: View {
             }
         }
         .padding(.vertical, 4)
+    }
+
+    private var durationText: String {
+        if isPlaying {
+            return "\(ProjectView.timeString(min(playbackElapsed, track.duration))) / \(ProjectView.timeString(track.duration))"
+        }
+        return ProjectView.timeString(track.duration)
     }
 }
 
