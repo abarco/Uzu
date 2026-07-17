@@ -271,6 +271,23 @@ actor AudioEngineService {
         playback.setVolume(volume, trackID: trackID)
     }
 
+    // MARK: - Export
+
+    /// Offline-renders the mix to an M4A. The realtime engine must not run
+    /// during manual rendering (see CLAUDE.md gotchas), so everything is torn
+    /// down first; the next play/record starts a fresh engine as usual.
+    func exportMix(_ items: [MixItem], to url: URL, sampleRate: Double) throws -> ExportService.Result {
+        guard !recorder.isRecording else {
+            throw UzuError.exportFailed(
+                underlying: NSError(
+                    domain: "com.uzu.app", code: 8,
+                    userInfo: [NSLocalizedDescriptionKey: "Can't export while recording"]))
+        }
+        rebuildEngine()
+        Log.export.info("Export begin: \(items.count) track(s) → \(url.lastPathComponent, privacy: .public)")
+        return try ExportService().export(items: items, to: url, sampleRate: sampleRate)
+    }
+
     func stopPlayback() {
         playback.stop(engine: engine)
         stopEngineIfIdle()

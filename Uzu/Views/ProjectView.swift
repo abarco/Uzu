@@ -25,6 +25,30 @@ struct ProjectView: View {
             }
             .navigationTitle(model.project?.name ?? "Uzu")
             .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    if model.isExporting {
+                        ProgressView()
+                    } else {
+                        Button {
+                            Task { await model.exportSong() }
+                        } label: {
+                            Image(systemName: "square.and.arrow.up")
+                        }
+                        .disabled(!model.canExport)
+                        .accessibilityLabel("Export song")
+                    }
+                }
+            }
+        }
+        .sheet(
+            item: Binding(
+                get: { model.exportedFile },
+                set: { model.exportedFile = $0 }
+            )
+        ) { file in
+            ShareSheet(items: [file.url])
+                .presentationDetents([.medium, .large])
         }
         .task {
             await model.onAppear()
@@ -379,6 +403,16 @@ private struct TrackRow: View {
         }
         .padding(.vertical, 4)
     }
+}
+
+private struct ShareSheet: UIViewControllerRepresentable {
+    let items: [Any]
+
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        UIActivityViewController(activityItems: items, applicationActivities: nil)
+    }
+
+    func updateUIViewController(_ controller: UIActivityViewController, context: Context) {}
 }
 
 private struct CountInOverlay: View {

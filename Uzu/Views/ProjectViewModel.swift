@@ -40,7 +40,16 @@ final class ProjectViewModel {
     private(set) var playingTrackID: UUID?
     private(set) var isPlayingMix = false
     private(set) var playbackElapsed: TimeInterval = 0
+    private(set) var isExporting = false
+    var exportedFile: ExportedFile?
     var errorMessage: String?
+
+    /// Identifiable wrapper so the share sheet uses .sheet(item:) — the
+    /// isPresented variant can capture stale nil state on first presentation.
+    struct ExportedFile: Identifiable, Equatable {
+        let url: URL
+        var id: String { url.absoluteString }
+    }
 
     var mixDuration: TimeInterval {
         SyncMath.mixDuration(of: project?.tracks ?? [])
@@ -401,6 +410,38 @@ final class ProjectViewModel {
             await audio.setTrackVolume(track.isMuted ? 0 : track.gain, trackID: trackID)
         }
         persist(project)
+    }
+
+    // MARK: - Export
+
+    var canExport: Bool {
+        !(project?.tracks.isEmpty ?? true) && overdubStage == .idle && !isExporting
+    }
+
+    func exportSong() async {
+        guard canExport, let project else { return }
+        await stopAllPlayback()
+        isExporting = true
+        defer { isExporting = false }
+
+        let exportsFolder = URL.documentsDirectory.appending(path: "Exports")
+        do {
+            try FileManager.default.createDirectory(
+                at: exportsFolder, withIntermediateDirectories: true)
+            let formatter = DateFormatter()
+            formatter.dateFormat = "yyyy-MM-dd HH.mm.ss"
+            let fileName = "\(project.name) \(formatter.string(from: Date())).m4a"
+            let url = exportsFolder.appending(path: fileName)
+            let result = try await audio.exportMix(
+                mixItems(for: project), to: url,
+                sampleRate: project.sampleRate > 0 ? project.sampleRate : 48_000)
+            Log.export.info("Export ready for sharing: \(result.duration, format: .fixed(precision: 2))s")
+            exportedFile = ExportedFile(url: url)
+        } catch let error as UzuError {
+            errorMessage = error.userMessage
+        } catch {
+            errorMessage = UzuError.exportFailed(underlying: error).userMessage
+        }
     }
 
     // MARK: - Deleting tracks
