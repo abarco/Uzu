@@ -13,6 +13,14 @@ final class UzuUITests: XCTestCase {
         let app = XCUIApplication()
         app.launch()
 
+        // Projects list is the root now: create a fresh song each run.
+        let newSongButton = app.navigationBars.buttons["New song"]
+        XCTAssertTrue(newSongButton.waitForExistence(timeout: 10), "Projects list should be on screen")
+        newSongButton.tap()
+        let createButton = app.alerts.buttons["Create"]
+        XCTAssertTrue(createButton.waitForExistence(timeout: 5), "New-song alert should appear")
+        createButton.tap()
+
         let addPart = app.buttons["Add a part"]
         XCTAssertTrue(addPart.waitForExistence(timeout: 10), "Add a part button should be on screen")
         addPart.tap()

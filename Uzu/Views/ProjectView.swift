@@ -1,10 +1,11 @@
 import SwiftUI
 
 struct ProjectView: View {
-    @State private var model = ProjectViewModel()
+    @State private var model: ProjectViewModel
     @State private var expandedTrackID: UUID?
     @State private var trackToDelete: Track?
     @State private var trackToRename: Track?
+    @State private var trackToTrim: Track?
     @State private var renameText = ""
     @State private var showNamePicker = false
     @State private var showCustomNameEntry = false
@@ -12,34 +13,32 @@ struct ProjectView: View {
     @State private var speakerWarningPartName: String?
     @State private var showDiscardConfirmation = false
 
+    init(project: SongProject) {
+        _model = State(initialValue: ProjectViewModel(project: project))
+    }
+
     var body: some View {
-        NavigationStack {
-            Group {
-                if model.micPermission == .denied {
-                    MicPermissionDeniedView(openSettings: model.openSystemSettings)
-                } else if model.project == nil {
-                    // Visible the moment SwiftUI takes over from the (static,
-                    // spinner-less by iOS design) launch screen.
-                    LoadingView()
-                } else {
-                    trackListScreen
-                }
+        Group {
+            if model.micPermission == .denied {
+                MicPermissionDeniedView(openSettings: model.openSystemSettings)
+            } else {
+                trackListScreen
             }
-            .navigationTitle(model.project?.name ?? "Uzu")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    if model.isExporting {
-                        ProgressView()
-                    } else {
-                        Button {
-                            Task { await model.exportSong() }
-                        } label: {
-                            Image(systemName: "square.and.arrow.up")
-                        }
-                        .disabled(!model.canExport)
-                        .accessibilityLabel("Export song")
+        }
+        .navigationTitle(model.project?.name ?? "Uzu")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                if model.isExporting {
+                    ProgressView()
+                } else {
+                    Button {
+                        Task { await model.exportSong() }
+                    } label: {
+                        Image(systemName: "square.and.arrow.up")
                     }
+                    .disabled(!model.canExport)
+                    .accessibilityLabel("Export song")
                 }
             }
         }
@@ -89,12 +88,14 @@ struct ProjectView: View {
                 List(project.tracks) { track in
                     TrackRow(
                         track: track,
+                        peaks: model.waveforms[track.id],
                         isPlaying: model.playingTrackID == track.id,
                         playbackElapsed: model.playbackElapsed,
                         isExpanded: expandedTrackID == track.id,
                         togglePlay: { Task { await model.togglePlayback(for: track) } },
                         toggleMute: { model.toggleMute(for: track.id) },
                         setGain: { model.setGain($0, for: track.id) },
+                        requestTrim: { trackToTrim = track },
                         toggleExpanded: {
                             withAnimation(.snappy) {
                                 expandedTrackID = expandedTrackID == track.id ? nil : track.id
@@ -116,6 +117,12 @@ struct ProjectView: View {
                             Label("Rename", systemImage: "pencil")
                         }
                         .tint(.blue)
+                        Button {
+                            Task { await model.beginReRecord(track: track) }
+                        } label: {
+                            Label("Re-record", systemImage: "arrow.counterclockwise.circle")
+                        }
+                        .tint(.orange)
                     }
                 }
                 .listStyle(.plain)
@@ -147,6 +154,12 @@ struct ProjectView: View {
                         model.renameTrack(track.id, to: renameText)
                     }
                     Button("Cancel", role: .cancel) {}
+                }
+                .sheet(item: $trackToTrim) { track in
+                    TrimSheet(track: track) { keepStart, keepEnd in
+                        Task { await model.trimTrack(track.id, keepStart: keepStart, keepEnd: keepEnd) }
+                    }
+                    .presentationDetents([.medium])
                 }
                 transportBar
             } else {
@@ -372,12 +385,14 @@ struct ProjectView: View {
 
 private struct TrackRow: View {
     let track: Track
+    let peaks: [Float]?
     let isPlaying: Bool
     let playbackElapsed: TimeInterval
     let isExpanded: Bool
     let togglePlay: () -> Void
     let toggleMute: () -> Void
     let setGain: (Float) -> Void
+    let requestTrim: () -> Void
     let toggleExpanded: () -> Void
 
     var body: some View {
@@ -419,6 +434,13 @@ private struct TrackRow: View {
             .contentShape(Rectangle())
             .onTapGesture(perform: toggleExpanded)
 
+            if let peaks, !peaks.isEmpty {
+                WaveformView(peaks: peaks, tint: track.isMuted ? .secondary : Color.red)
+                    .frame(height: 24)
+                    .padding(.leading, 44)
+                    .opacity(track.isMuted ? 0.4 : 0.85)
+            }
+
             if isExpanded {
                 HStack(spacing: 8) {
                     Image(systemName: "speaker.wave.1")
@@ -434,6 +456,11 @@ private struct TrackRow: View {
                     Image(systemName: "speaker.wave.3")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    Button(action: requestTrim) {
+                        Label("Trim", systemImage: "scissors")
+                            .font(.caption.weight(.semibold))
+                    }
+                    .buttonStyle(.bordered)
                 }
                 .padding(.leading, 44)
             }
@@ -446,6 +473,87 @@ private struct TrackRow: View {
             return "\(ProjectView.timeString(min(playbackElapsed, track.duration))) / \(ProjectView.timeString(track.duration))"
         }
         return ProjectView.timeString(track.duration)
+    }
+}
+
+private struct WaveformView: View {
+    let peaks: [Float]
+    let tint: Color
+
+    var body: some View {
+        Canvas { context, size in
+            let barWidth = size.width / CGFloat(peaks.count)
+            let midY = size.height / 2
+            for (index, peak) in peaks.enumerated() {
+                let barHeight = max(1.5, CGFloat(peak) * size.height)
+                let rect = CGRect(
+                    x: CGFloat(index) * barWidth + barWidth * 0.15,
+                    y: midY - barHeight / 2,
+                    width: barWidth * 0.7,
+                    height: barHeight)
+                context.fill(
+                    Path(roundedRect: rect, cornerRadius: barWidth * 0.3),
+                    with: .color(tint))
+            }
+        }
+    }
+}
+
+private struct TrimSheet: View {
+    let track: Track
+    let onTrim: (TimeInterval, TimeInterval) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var keepStart: Double = 0
+    @State private var keepEnd: Double
+
+    init(track: Track, onTrim: @escaping (TimeInterval, TimeInterval) -> Void) {
+        self.track = track
+        self.onTrim = onTrim
+        _keepEnd = State(initialValue: track.duration)
+    }
+
+    private var isValid: Bool {
+        keepEnd - keepStart >= 0.2
+    }
+    private var isChanged: Bool {
+        keepStart > 0.01 || keepEnd < track.duration - 0.01
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    LabeledContent("Start", value: timeString(keepStart))
+                    Slider(value: $keepStart, in: 0...track.duration)
+                    LabeledContent("End", value: timeString(keepEnd))
+                    Slider(value: $keepEnd, in: 0...track.duration)
+                } footer: {
+                    Text(
+                        isValid
+                            ? "Keeps \(timeString(keepEnd - keepStart)) of \(timeString(track.duration)). Trimming can't be undone."
+                            : "The kept region must be at least 0.2 seconds.")
+                }
+            }
+            .navigationTitle("Trim \"\(track.name)\"")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Trim") {
+                        onTrim(keepStart, min(keepEnd, track.duration))
+                        dismiss()
+                    }
+                    .disabled(!isValid || !isChanged)
+                }
+            }
+        }
+    }
+
+    private func timeString(_ seconds: TimeInterval) -> String {
+        String(format: "%.1fs", seconds)
     }
 }
 
@@ -516,5 +624,8 @@ private struct MicPermissionDeniedView: View {
 }
 
 #Preview {
-    ProjectView()
+    NavigationStack {
+        ProjectView(
+            project: SongProject(id: UUID(), name: "My Song", sampleRate: 48_000, tracks: []))
+    }
 }

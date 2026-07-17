@@ -55,16 +55,21 @@ final class ProjectViewModel {
         SyncMath.mixDuration(of: project?.tracks ?? [])
     }
 
+    /// Waveform peak bins per track, computed lazily off the main thread.
+    private(set) var waveforms: [UUID: [Float]] = [:]
+
     private let store: ProjectStore
-    private let audio = AudioEngineService()
+    private let audio = AudioEngineService.shared
     private var takeName: String?
     private var takeFileName: String?
+    private var replacingTrackID: UUID?
     private var recordingTimerTask: Task<Void, Never>?
     private var playbackTimerTask: Task<Void, Never>?
     private var countInTask: Task<Void, Never>?
 
-    init(store: ProjectStore = .standard()) {
+    init(project: SongProject, store: ProjectStore = .standard()) {
         self.store = store
+        self.project = project
     }
 
     // MARK: - Lifecycle
@@ -74,21 +79,29 @@ final class ProjectViewModel {
         await audio.activate { [weak self] event in
             Task { @MainActor in self?.handle(event) }
         }
-        loadOrCreateProject()
+        // The navigation link hands us a snapshot that may be stale (the list
+        // only knows what was on disk when IT loaded). Disk is the truth —
+        // trusting the snapshot here can display, and worse later persist,
+        // an old copy of the project.
+        if let id = project?.id, let fresh = try? store.loadProject(id: id) {
+            project = fresh
+        }
+        loadMissingWaveforms()
     }
 
-    private func loadOrCreateProject() {
-        guard project == nil else { return }
-        if let existing = store.loadAllProjects()
-            .sorted(by: { $0.name < $1.name }).first {
-            project = existing
-            Log.ui.info("Loaded project \(existing.id, privacy: .public)")
-        } else {
-            do {
-                project = try store.createProject(name: "My Song", sampleRate: 0)
-            } catch {
-                Log.store.error("Failed to create project: \(error)")
-                errorMessage = "Couldn't create a project on disk."
+    // MARK: - Waveforms
+
+    private func loadMissingWaveforms() {
+        guard let project else { return }
+        for track in project.tracks where waveforms[track.id] == nil {
+            let url = store.audioFileURL(fileName: track.fileName, projectID: project.id)
+            let skipHead = max(0, -track.startOffset)
+            let trackID = track.id
+            Task.detached(priority: .utility) { [weak self] in
+                let peaks = (try? WaveformLoader.peaks(fileURL: url, skipHeadSeconds: skipHead)) ?? []
+                await MainActor.run { [weak self] in
+                    self?.waveforms[trackID] = peaks
+                }
             }
         }
     }
@@ -119,6 +132,14 @@ final class ProjectViewModel {
         return await audio.outputIsBuiltInSpeaker
     }
 
+    /// Replace an existing part in place: same overdub flow, but the track
+    /// being replaced is excluded from the backing mix, and Keep swaps the
+    /// file under the existing row.
+    func beginReRecord(track: Track) async {
+        replacingTrackID = track.id
+        await beginAddPart(named: track.name)
+    }
+
     /// Starts the take: count-in, then recording over all existing tracks.
     func beginAddPart(named name: String) async {
         guard overdubStage == .idle, var project else { return }
@@ -145,8 +166,9 @@ final class ProjectViewModel {
             // so the backing tracks are muted (still scheduled, volume 0, so
             // the timing math is identical). The count-in click stays audible.
             let onSpeaker = await audio.outputIsBuiltInSpeaker
-            backingMutedForSpeaker = onSpeaker && !project.tracks.isEmpty
             var items = mixItems(for: project)
+                .filter { $0.trackID != replacingTrackID }
+            backingMutedForSpeaker = onSpeaker && !items.isEmpty
             if onSpeaker {
                 for index in items.indices { items[index].isMuted = true }
             }
@@ -224,21 +246,36 @@ final class ProjectViewModel {
 
     func keepTake() {
         guard var project, let take = pendingTake else { return }
-        let track = Track(
-            id: UUID(),
-            name: uniqueName(for: take.name, in: project),
-            fileName: take.fileName,
-            gain: 1.0,
-            isMuted: false,
-            startOffset: take.startOffset,
-            duration: take.duration,
-            createdAt: Date()
-        )
-        project.tracks.append(track)
+        if let replacingID = replacingTrackID,
+            let index = project.tracks.firstIndex(where: { $0.id == replacingID }) {
+            // Re-record: swap the audio under the existing row, keep its
+            // name, position, gain, and mute state.
+            let oldFileName = project.tracks[index].fileName
+            project.tracks[index].fileName = take.fileName
+            project.tracks[index].startOffset = take.startOffset
+            project.tracks[index].duration = take.duration
+            project.tracks[index].createdAt = Date()
+            try? FileManager.default.removeItem(
+                at: store.audioFileURL(fileName: oldFileName, projectID: project.id))
+            waveforms[replacingID] = nil
+        } else {
+            let track = Track(
+                id: UUID(),
+                name: uniqueName(for: take.name, in: project),
+                fileName: take.fileName,
+                gain: 1.0,
+                isMuted: false,
+                startOffset: take.startOffset,
+                duration: take.duration,
+                createdAt: Date()
+            )
+            project.tracks.append(track)
+        }
         self.project = project
         persist(project)
         Task { await stopTakePreview() }
         resetTakeState()
+        loadMissingWaveforms()
     }
 
     /// Throw the take away without recording a replacement.
@@ -288,6 +325,7 @@ final class ProjectViewModel {
         pendingTake = nil
         takeName = nil
         takeFileName = nil
+        replacingTrackID = nil
         countInRemaining = 0
         backingMutedForSpeaker = false
         stopElapsedTimer()
@@ -445,6 +483,48 @@ final class ProjectViewModel {
         }
     }
 
+    // MARK: - Trim
+
+    /// Destructive trim: keeps `[keepStart, keepEnd]` of the track's audible
+    /// region, writing a new file and re-anchoring the remaining audio at its
+    /// original musical position.
+    func trimTrack(_ trackID: UUID, keepStart: TimeInterval, keepEnd: TimeInterval) async {
+        guard var project,
+            let index = project.tracks.firstIndex(where: { $0.id == trackID })
+        else { return }
+        let track = project.tracks[index]
+        let newDuration = keepEnd - keepStart
+        guard keepStart >= 0, newDuration > 0.1, keepEnd <= track.duration + 0.01 else { return }
+
+        await stopAllPlayback()
+
+        let newFileName = "\(UUID().uuidString).caf"
+        let source = store.audioFileURL(fileName: track.fileName, projectID: project.id)
+        let destination = store.audioFileURL(fileName: newFileName, projectID: project.id)
+        let extractStart = max(0, -track.startOffset) + keepStart
+
+        do {
+            try await Task.detached(priority: .userInitiated) {
+                try AudioFileEditor.extractRegion(
+                    source: source, destination: destination,
+                    startSeconds: extractStart, durationSeconds: newDuration)
+            }.value
+        } catch {
+            Log.store.error("Trim failed: \(error)")
+            errorMessage = "Couldn't trim that part."
+            return
+        }
+
+        try? FileManager.default.removeItem(at: source)
+        project.tracks[index].fileName = newFileName
+        project.tracks[index].startOffset = max(0, track.startOffset) + keepStart
+        project.tracks[index].duration = newDuration
+        self.project = project
+        waveforms[trackID] = nil
+        persist(project)
+        loadMissingWaveforms()
+    }
+
     // MARK: - Renaming tracks
 
     func renameTrack(_ trackID: UUID, to newName: String) {
@@ -468,6 +548,7 @@ final class ProjectViewModel {
         self.project = project
         try? FileManager.default.removeItem(
             at: store.audioFileURL(fileName: track.fileName, projectID: project.id))
+        waveforms[track.id] = nil
         persist(project)
         Log.ui.info("Deleted track \(track.id, privacy: .public)")
     }

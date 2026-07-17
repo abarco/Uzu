@@ -26,6 +26,10 @@ struct OverdubResult: Sendable {
 /// all existing tracks play sample-synchronized while the mic records. The
 /// first part is simply an overdub over an empty mix.
 actor AudioEngineService {
+    /// One engine owner for the whole app: view models come and go with the
+    /// projects screen, the audio stack does not.
+    static let shared = AudioEngineService()
+
     // Recreated (not reused) for every session start and after route/config
     // changes: a fresh engine derives all IO formats from the current route,
     // so stale taps/formats can never survive into the next start (the

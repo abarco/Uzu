@@ -70,6 +70,12 @@ final class ProjectStore: Sendable {
         return projects
     }
 
+    /// Removes the project folder — manifest and all audio files.
+    func deleteProject(id: UUID) throws {
+        try FileManager.default.removeItem(at: projectFolder(for: id))
+        Log.store.info("Deleted project \(id, privacy: .public)")
+    }
+
     // MARK: - Codable configuration
 
     private static func encoder() -> JSONEncoder {

@@ -4,7 +4,7 @@ import SwiftUI
 struct UzuApp: App {
     var body: some Scene {
         WindowGroup {
-            ProjectView()
+            ProjectsListView()
         }
     }
 }

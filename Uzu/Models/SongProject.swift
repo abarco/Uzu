@@ -1,13 +1,13 @@
 import Foundation
 
-struct SongProject: Codable, Identifiable, Equatable {
+struct SongProject: Codable, Identifiable, Equatable, Hashable {
     var id: UUID
     var name: String
     var sampleRate: Double
     var tracks: [Track]
 }
 
-struct Track: Codable, Identifiable, Equatable {
+struct Track: Codable, Identifiable, Equatable, Hashable {
     var id: UUID
     var name: String          // "Guitar", "Lead vocal", ...
     var fileName: String      // relative to project folder
